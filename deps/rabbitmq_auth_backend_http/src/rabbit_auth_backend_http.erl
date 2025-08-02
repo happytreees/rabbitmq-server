@@ -27,6 +27,12 @@
 
 %%--------------------------------------------------------------------
 
+get_client_ip(Conn) ->
+    case rabbit_net:proxy_peername(Conn) of
+        {ok, {Addr, _Port}} -> Addr;
+        _                   -> element(2, Conn)
+    end.
+
 description() ->
     [{name, <<"HTTP">>},
      {description, <<"HTTP authentication / authorisation">>}].
@@ -92,7 +98,6 @@ extract_other_credentials(AuthProps) ->
     _ -> PublicAuthProps
   end.
 
-
 user_login_authorization(Username, AuthProps) ->
     case user_login_authentication(Username, AuthProps) of
         {ok, #auth_user{impl = Impl}} -> {ok, Impl};
@@ -104,14 +109,21 @@ check_vhost_access(#auth_user{username = Username, tags = Tags}, VHost, undefine
 check_vhost_access(#auth_user{username = Username, tags = Tags}, VHost,
                    AuthzData = #{peeraddr := PeerAddr}) when is_map(AuthzData) ->
     AuthzData1 = maps:remove(peeraddr, AuthzData),
-    Ip = parse_peeraddr(PeerAddr),
+    Ip = case rabbit_reader:get_proxy_info(self()) of
+             {ok, #{peer_addr := RealPeer}} -> parse_peeraddr(RealPeer);
+             _ -> parse_peeraddr(PeerAddr)
+         end,
     do_check_vhost_access(Username, Tags, VHost, Ip, AuthzData1).
 
 do_check_vhost_access(Username, Tags, VHost, Ip, AuthzData) ->
     OptionsParameters = context_as_parameters(AuthzData),
+    ClientIP = case Ip of
+                   "" -> inet:ntoa(get_client_ip(element(1, get_connection())));
+                   _  -> Ip
+               end,
     bool_req(vhost_path, [{username, Username},
                           {vhost,    VHost},
-                          {ip,       Ip},
+                          {ip,       ClientIP},
                           {tags,     join_tags(Tags)}] ++ OptionsParameters).
 
 check_resource_access(#auth_user{username = Username, tags = Tags},
@@ -119,24 +131,28 @@ check_resource_access(#auth_user{username = Username, tags = Tags},
                       Permission,
                       AuthzContext) ->
     OptionsParameters = context_as_parameters(AuthzContext),
+    {Conn, _} = get_connection(),
     bool_req(resource_path, [{username,   Username},
                              {vhost,      VHost},
                              {resource,   Type},
                              {name,       Name},
                              {permission, Permission},
-                             {tags, join_tags(Tags)}] ++ OptionsParameters).
+                             {ip,         inet:ntoa(get_client_ip(Conn))},
+                             {tags,       join_tags(Tags)}] ++ OptionsParameters).
 
 check_topic_access(#auth_user{username = Username, tags = Tags},
                    #resource{virtual_host = VHost, kind = topic = Type, name = Name},
                    Permission,
                    Context) ->
     OptionsParameters = context_as_parameters(Context),
+    {Conn, _} = get_connection(),
     bool_req(topic_path, [{username,   Username},
-        {vhost,      VHost},
-        {resource,   Type},
-        {name,       Name},
-        {permission, Permission},
-        {tags, join_tags(Tags)}] ++ OptionsParameters).
+                          {vhost,      VHost},
+                          {resource,   Type},
+                          {name,       Name},
+                          {permission, Permission},
+                          {ip,         inet:ntoa(get_client_ip(Conn))},
+                          {tags,       join_tags(Tags)}] ++ OptionsParameters).
 
 expiry_timestamp(_) -> never.
 
@@ -197,7 +213,8 @@ do_http_req(Path0, Query) ->
             {ok, Val2} -> Val2;
             _ -> RequestTimeout
         end,
-    ?LOG_DEBUG("auth_backend_http: request timeout: ~tp, connection timeout: ~tp", [RequestTimeout, ConnectionTimeout]),
+    ?LOG_DEBUG("auth_backend_http: request timeout: ~tp, connection timeout: ~tp",
+               [RequestTimeout, ConnectionTimeout]),
     HttpOpts = [{timeout, RequestTimeout},
                 {connect_timeout, ConnectionTimeout}] ++ ssl_options(),
     case httpc:request(Method, Request, HttpOpts, []) of
